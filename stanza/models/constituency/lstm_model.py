@@ -13,6 +13,7 @@ import torch.nn as nn
 from torch.nn.utils.rnn import pack_padded_sequence
 
 from stanza.models.constituency.base_model import BaseModel
+from stanza.models.constituency.constituent_builder import ConstituentBuilder
 from stanza.models.constituency.parse_transitions import TransitionScheme, TransitionNode, Constituent, ConstituentNode
 from stanza.models.constituency.parse_tree import Tree
 from stanza.models.constituency.tree_stack import TreeStack
@@ -65,6 +66,7 @@ class LSTMModel(BaseModel, nn.Module):
             self.backward_charlm_vocab = None
 
         self.word_embedder = WordEmbedder(pt, forward_charlm, backward_charlm, tags, words, rare_words, args)
+        self.constituent_builder = ConstituentBuilder(open_nodes, args)
 
         self.root_labels = sorted(list(root_labels))
         self.constituents = sorted(list(constituents))
@@ -101,31 +103,16 @@ class LSTMModel(BaseModel, nn.Module):
                 unary_transforms[constituent] = nn.Linear(self.hidden_size, self.hidden_size)
             self.unary_transforms = nn.ModuleDict(unary_transforms)
 
-        self.open_nodes = sorted(list(open_nodes))
-        # an embedding for the spot on the constituent LSTM taken up by the Open transitions
-        # the pattern when condensing constituents is embedding - con1 - con2 - con3 - embedding
-        # TODO: try the two ends have different embeddings?
-        self.open_node_map = { x: i for (i, x) in enumerate(self.open_nodes) }
-        self.open_node_embedding = nn.Embedding(num_embeddings = len(self.open_node_map),
-                                                embedding_dim = self.hidden_size)
-
+        self.open_nodes = self.constituent_builder.open_nodes
+        self.open_node_map = self.constituent_builder.open_node_map
+        self.register_buffer('open_node_tensors', self.constituent_builder.open_node_tensors)
         # TODO: remove this `get` once it's not needed
         if args.get('combined_dummy_embedding', False):
-            self.dummy_embedding = self.open_node_embedding
+            self.dummy_embedding = self.constituent_builder.open_node_embedding
         else:
             self.dummy_embedding = nn.Embedding(num_embeddings = len(self.open_node_map),
                                                 embedding_dim = self.hidden_size)
         self.register_buffer('open_node_tensors', torch.tensor(range(len(open_nodes)), requires_grad=False))
-
-        # forward and backward pieces for crunching several
-        # constituents into one, combined into a bi-lstm
-        # TODO: make the hidden size here an option?
-        self.constituent_reduce_lstm = nn.LSTM(input_size=self.hidden_size, hidden_size=self.hidden_size, num_layers=self.num_layers, bidirectional=True, dropout=self.lstm_layer_dropout)
-        # affine transformation from bi-lstm reduce to a new hidden layer
-        self.reduce_linear = nn.Linear(self.hidden_size * 2, self.hidden_size)
-        if self.args['nonlinearity'] in ('relu', 'leaky_relu'):
-            nn.init.kaiming_normal_(self.reduce_linear.weight, nonlinearity=self.args['nonlinearity'])
-            nn.init.uniform_(self.reduce_linear.bias, 0, 1 / (self.hidden_size * 2) ** 0.5)
 
         self.nonlinearity = build_nonlinearity(self.args['nonlinearity'])
 
@@ -210,41 +197,12 @@ class LSTMModel(BaseModel, nn.Module):
         return top_constituent
 
     def build_constituents(self, labels, children_lists):
-        label_hx = [self.open_node_embedding(self.open_node_tensors[self.open_node_map[label]]) for label in labels]
-
-        max_length = max(len(children) for children in children_lists)
-        zeros = torch.zeros(self.hidden_size, device=label_hx[0].device)
-        node_hx = [[child.output for child in children] for children in children_lists]
-        # weirdly, this is faster than using pack_sequence
-        unpacked_hx = [[lhx] + nhx + [lhx] + [zeros] * (max_length - len(nhx)) for lhx, nhx in zip(label_hx, node_hx)]
-        unpacked_hx = [self.lstm_input_dropout(torch.stack(nhx)) for nhx in unpacked_hx]
-        packed_hx = torch.stack(unpacked_hx, axis=1)
-        packed_hx = torch.nn.utils.rnn.pack_padded_sequence(packed_hx, [len(x)+2 for x in children_lists], enforce_sorted=False)
-        lstm_output = self.constituent_reduce_lstm(packed_hx)
-        # take just the output of the final layer
-        #   result of lstm is ouput, (hx, cx)
-        #   so [1][0] gets hx
-        #      [1][0][-1] is the final output
-        # will be shape len(children_lists) * 2, hidden_size for bidirectional
-        # where forward outputs are -2 and backwards are -1
-        lstm_output = lstm_output[1][0]
-        forward_hx = lstm_output[-2, :]
-        backward_hx = lstm_output[-1, :]
-
-        hx = self.reduce_linear(torch.cat((forward_hx, backward_hx), axis=1))
-        hx = self.nonlinearity(hx)
-
-        constituents = []
-        for idx, (label, children) in enumerate(zip(labels, children_lists)):
-            children = [child.value for child in children]
-            if isinstance(label, str):
-                node = Tree(label=label, children=children)
-            else:
-                for value in reversed(label):
-                    node = Tree(label=value, children=children)
-                    children = node
-            constituents.append(Constituent(value=node, hx=hx[idx, :]))
-        return constituents
+        """
+        labels: a list of the top labels to produce
+        children_lists: a list of lists
+          each sublist has the children being created by this function call
+        """
+        return self.constituent_builder.build_constituents(labels, children_lists)
 
     def push_constituents(self, constituent_stacks, constituents):
         current_nodes = [stack.value for stack in constituent_stacks]
