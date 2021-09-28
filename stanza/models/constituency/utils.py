@@ -9,6 +9,8 @@ import torch.nn as nn
 
 from stanza.models.common.doc import TEXT, Document
 
+import torch.nn as nn
+
 def replace_tags(tree, tags):
     if tree.is_leaf():
         raise ValueError("Must call replace_tags with non-leaf")
@@ -62,6 +64,9 @@ def retag_trees(trees, pipeline, xpos=True):
     return new_trees
 
 def build_nonlinearity(nonlinearity):
+    """
+    Returns a specific nonlinearity by name
+    """
     if nonlinearity == 'tanh':
         return nn.Tanh()
     elif nonlinearity == 'relu':

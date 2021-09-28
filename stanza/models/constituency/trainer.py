@@ -87,7 +87,7 @@ class Trainer:
         unary_limit = params.get("unary_limit", UNARY_LIMIT)
 
         if model_type == 'LSTM':
-            model = LSTMModel(pretrain=pt,
+            model = LSTMModel(pt=pt,
                               forward_charlm=forward_charlm,
                               backward_charlm=backward_charlm,
                               transitions=params['transitions'],
