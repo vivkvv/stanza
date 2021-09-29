@@ -29,6 +29,7 @@ from stanza.models.constituency import tree_reader
 from stanza.models.constituency.base_model import SimpleModel, UNARY_LIMIT
 from stanza.models.constituency.dynamic_oracle import RepairType, oracle_inorder_error
 from stanza.models.constituency.lstm_model import LSTMModel
+from stanza.models.constituency.lstm_discriminator import LSTMDiscriminator
 from stanza.models.constituency.parse_transitions import State, TransitionScheme
 from stanza.models.constituency.utils import retag_trees
 from stanza.server.parser_eval import EvaluateParser
@@ -43,9 +44,11 @@ class Trainer:
 
     Not inheriting from common/trainer.py because there's no concept of change_lr (yet?)
     """
-    def __init__(self, model=None, optimizer=None):
+    def __init__(self, model=None, model_optimizer=None, discriminator=None, discriminator_optimizer=None):
         self.model = model
-        self.optimizer = optimizer
+        self.model_optimizer = model_optimizer
+        self.discriminator = discriminator
+        self.discriminator_optimizer = discriminator_optimizer
 
     def uses_xpos(self):
         return self.model.args['retag_package'] is not None and self.model.args['retag_method'] == 'xpos'
@@ -54,13 +57,18 @@ class Trainer:
         """
         Save the model (and by default the optimizer) to the given path
         """
-        params = self.model.get_params()
+        model_params = self.model.get_params()
+        discrim_params = self.discriminator.get_params()
         checkpoint = {
-            'params': params,
             'model_type': 'LSTM',
+            'model_params': model_params,
+            'discrim_params': discrim_params
         }
-        if save_optimizer and self.optimizer is not None:
-            checkpoint['optimizer_state_dict'] = self.optimizer.state_dict()
+        if save_optimizer and self.model_optimizer is not None:
+            checkpoint['model_optimizer_state_dict'] = self.model_optimizer.state_dict()
+        if save_optimizer and self.discriminator_optimizer is not None:
+            checkpoint['discrim_optimizer_state_dict'] = self.discriminator_optimizer.state_dict()
+
         torch.save(checkpoint, filename, _use_new_zipfile_serialization=False)
         logger.info("Model saved to %s", filename)
 
@@ -83,7 +91,7 @@ class Trainer:
         logger.debug("Loaded model from %s", filename)
 
         model_type = checkpoint['model_type']
-        params = checkpoint.get('params', checkpoint)
+        params = checkpoint['model_params']
         unary_limit = params.get("unary_limit", UNARY_LIMIT)
 
         if model_type == 'LSTM':
@@ -101,28 +109,47 @@ class Trainer:
                               args=params['config'])
         else:
             raise ValueError("Unknown model type {}".format(model_type))
-        model.load_state_dict(params['model'], strict=False)
+        model.load_state_dict(params, strict=False)
+
+        discrim = LSTMDiscriminator(pt=pt,
+                                    forward_charlm=forward_charlm,
+                                    backward_charlm=backward_charlm,
+                                    transitions=params['transitions'],
+                                    tags=params['tags'],
+                                    words=params['words'],
+                                    rare_words=params['rare_words'],
+                                    open_nodes=params['open_nodes'],
+                                    args=params['config'])
+        discrim.load_state_dict(checkpoint['discrim_params'], strict=False)
 
         if use_gpu:
             model.cuda()
+            discrim.cuda()
 
         if load_optimizer:
             optimizer_args = dict(params['config'])
             optimizer_args.update(args)
-            optimizer = build_optimizer(optimizer_args, model)
+            model_optimizer = build_optimizer(optimizer_args, model)
+            discrim_optimizer = build_optimizer(optimizer_args, discrim)
 
-            if checkpoint.get('optimizer_state_dict', None) is not None:
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            if checkpoint.get('model_optimizer_state_dict', None) is not None:
+                model_optimizer.load_state_dict(checkpoint['model_optimizer_state_dict'])
             else:
-                logger.info("Attempted to load optimizer to resume training, but optimizer not saved.  Creating new optimizer")
+                logger.info("Attempted to load model optimizer to resume training, but optimizer not saved.  Creating new optimizer")
+
+            if checkpoint.get('discrim_optimizer_state_dict', None) is not None:
+                discrim_optimizer.load_state_dict(checkpoint['discrim_optimizer_state_dict'])
+            else:
+                logger.info("Attempted to load discriminator optimizer to resume training, but optimizer not saved.  Creating new optimizer")
         else:
-            optimizer = None
+            model_optimizer = None
+            discrim_optimizer = None
 
         logger.debug("-- MODEL CONFIG --")
         for k in model.args.keys():
             logger.debug("  --%s: %s", k, model.args[k])
 
-        return Trainer(model=model, optimizer=optimizer)
+        return Trainer(model=model, model_optimizer=model_optimizer, discriminator=discrim, discriminator_optimizer=discrim_optimizer)
 
 
 def build_optimizer(args, model):
@@ -318,13 +345,18 @@ def build_trainer(args, train_trees, dev_trees, pt, forward_charlm, backward_cha
         trainer = Trainer.load(model_load_file, pt, forward_charlm, backward_charlm, args['cuda'], args, load_optimizer=True)
     else:
         model = LSTMModel(pt, forward_charlm, backward_charlm, train_transitions, train_constituents, tags, words, rare_words, root_labels, open_nodes, unary_limit, args)
+        discriminator = LSTMDiscriminator(pt, forward_charlm, backward_charlm, train_transitions, tags, words, rare_words, train_constituents, args)
+
         if args['cuda']:
             model.cuda()
+            discriminator.cuda()
+
         logger.info("Number of words in the training set found in the embedding: {} out of {}".format(model.num_words_known(words), len(words)))
 
-        optimizer = build_optimizer(args, model)
+        model_optimizer = build_optimizer(args, model)
+        discrim_optimizer = build_optimizer(args, discriminator)
 
-        trainer = Trainer(model, optimizer)
+        trainer = Trainer(model, model_optimizer, discriminator, discrim_optimizer)
 
     return trainer, train_sequences, train_transitions
 
@@ -357,6 +389,17 @@ def train(args, model_save_file, model_load_file, model_save_latest_file, retag_
     iterate_training(trainer, train_trees, train_sequences, train_transitions, dev_trees, args, model_save_file, model_save_latest_file)
 
 
+
+EPOCH_LOG = """
+Epoch {} finished
+  Transitions correct: {}
+  Transitions incorrect: {}
+  Total loss for epoch: {}
+  Total discrim loss for epoch: {}
+  Total gan loss for epoch: {}
+  Dev score      ({:5}): {}
+  Best dev score ({:5}): {}"""
+
 def iterate_training(trainer, train_trees, train_sequences, transitions, dev_trees, args, model_filename, model_latest_filename):
     """
     Given an initialized model, a processed dataset, and a secondary dev dataset, train the model
@@ -373,17 +416,17 @@ def iterate_training(trainer, train_trees, train_sequences, transitions, dev_tre
     is to use the gold transition.
     """
     model = trainer.model
-    optimizer = trainer.optimizer
 
     model_loss_function = nn.CrossEntropyLoss(reduction='sum')
+    discrim_loss_function = nn.BCEWithLogitsLoss(reduction='sum')
+
     if args['cuda']:
         model_loss_function.cuda()
+        discrim_loss_function.cuda()
 
-    device = next(model.parameters()).device
+    device = next(trainer.model.parameters()).device
     transition_tensors = {x: torch.tensor(y, requires_grad=False, device=device).unsqueeze(0)
                           for (y, x) in enumerate(transitions)}
-
-    model.train()
 
     train_data = list(zip(train_trees, train_sequences))
 
@@ -394,7 +437,9 @@ def iterate_training(trainer, train_trees, train_sequences, transitions, dev_tre
     best_f1 = 0.0
     best_epoch = 0
     for epoch in range(1, args['epochs']+1):
-        model.train()
+        trainer.model.train()
+        trainer.discriminator.train()
+
         logger.info("Starting epoch %d", epoch)
         epoch_data = leftover_training_data
         while len(epoch_data) < args['epoch_size']:
@@ -407,9 +452,11 @@ def iterate_training(trainer, train_trees, train_sequences, transitions, dev_tre
         random.shuffle(interval_starts)
 
         epoch_loss, transitions_correct, transitions_incorrect = train_model_one_epoch(epoch, trainer, transition_tensors, model_loss_function, epoch_data, interval_starts, args)
+        discrim_loss = train_discriminator_one_epoch(trainer, discrim_loss_function, epoch_data, interval_starts, args)
+        generator_loss = train_generator_one_epoch(trainer, discrim_loss_function, epoch_data, interval_starts, args)
 
         # print statistics
-        f1 = run_dev_set(model, dev_trees, args)
+        f1 = run_dev_set(trainer.model, dev_trees, args)
         if f1 > best_f1:
             logger.info("New best dev score: %.5f > %.5f", f1, best_f1)
             best_f1 = f1
@@ -417,20 +464,93 @@ def iterate_training(trainer, train_trees, train_sequences, transitions, dev_tre
             trainer.save(model_filename, save_optimizer=True)
         if model_latest_filename:
             trainer.save(model_latest_filename, save_optimizer=True)
-        logger.info("Epoch {} finished\nTransitions correct: {}  Transitions incorrect: {}\n  Total loss for epoch: {}\n  Dev score      ({:5}): {}\n  Best dev score ({:5}): {}".format(epoch, transitions_correct, transitions_incorrect, epoch_loss, epoch, f1, best_epoch, best_f1))
+        logger.info(EPOCH_LOG.format(epoch, transitions_correct, transitions_incorrect, epoch_loss, discrim_loss, generator_loss, epoch, f1, best_epoch, best_f1))
+
+def train_generator_one_epoch(trainer, discrim_loss_function, epoch_data, interval_starts, args):
+    """
+    Reparse the sentences of the batch, score the trees using the discriminator, and train the model one step
+    """
+    epoch_loss = 0.0
+    device = next(trainer.model.parameters()).device
+    model = trainer.model
+    trainer.model.train()
+    sigmoid = nn.Sigmoid()
+
+    epoch_trees = [x[0] for x in epoch_data]
+    # we reparse one batch at a time instead of all at once because otherwise
+    # even a modest sized epoch will use up all GPU memory
+    for interval_start in tqdm(interval_starts, postfix="Generator GAN loss"):
+        batch = epoch_trees[interval_start:interval_start+args['train_batch_size']]
+        tree_iterator = iter(batch)
+        reparsed_epoch = parse_sentences(tree_iterator, build_batch_from_trees, args['eval_batch_size'], trainer.model, keep_state=True)
+        # these are the states of the best parse
+        # pred -> best parse -> state
+        reparsed_epoch = [x[1][0][2] for x in reparsed_epoch]
+        # output is basically an embedding for the constituent
+        # use it as input to the discriminator's final layers
+        reparsed_epoch = [sigmoid(x.constituents.value.output) for x in reparsed_epoch]
+        results = trainer.discriminator.output_from_embedding(reparsed_epoch)
+
+        # here it's ones instead of zeros on the pred trees because we want
+        # the model to learn to fool the discriminator
+        batch_loss = discrim_loss_function(results, torch.ones(results.shape, device=device))
+        batch_loss.backward()
+        epoch_loss += batch_loss.item()
+
+        trainer.model_optimizer.step()
+        trainer.model_optimizer.zero_grad()
+
+    return epoch_loss
+
+def train_discriminator_one_epoch(trainer, discrim_loss_function, epoch_data, interval_starts, args):
+    epoch_loss = 0.0
+    device = next(trainer.model.parameters()).device
+
+    logger.info("Reparsing trees from training batch using the model")
+    trainer.model.eval()
+    epoch_trees = [x[0] for x in epoch_data]
+    tree_iterator = iter(tqdm(epoch_trees))
+    with torch.no_grad():
+        reparsed_treebank = parse_sentences(tree_iterator, build_batch_from_trees, args['eval_batch_size'], trainer.model)
+
+    reparsed_gold = [x[0] for x in reparsed_treebank]
+    reparsed_pred = [x[1][0][0] for x in reparsed_treebank]
+
+    for interval_start in tqdm(interval_starts, postfix="Discriminator"):
+        # TODO: maybe only train gold trees where the model was wrong?
+        gold_batch = reparsed_gold[interval_start:interval_start+args['train_batch_size']]
+        gold_results = trainer.discriminator.forward(gold_batch)
+
+        batch_loss = discrim_loss_function(gold_results, torch.ones(gold_results.shape, device=device))
+        batch_loss.backward()
+        epoch_loss += batch_loss.item()
+
+        pred_batch = reparsed_pred[interval_start:interval_start+args['train_batch_size']]
+        pred_batch = [x for x, y in zip(pred_batch, gold_batch) if x != y]
+        if len(pred_batch) > 0:
+            pred_results = trainer.discriminator(pred_batch)
+
+        batch_loss = discrim_loss_function(pred_results, torch.zeros(pred_results.shape, device=device))
+        batch_loss.backward()
+        epoch_loss += batch_loss.item()
+
+        trainer.discriminator_optimizer.step()
+        trainer.discriminator_optimizer.zero_grad()
+
+    return epoch_loss
 
 def train_model_one_epoch(epoch, trainer, transition_tensors, model_loss_function, epoch_data, interval_starts, args):
     epoch_loss = 0.0
 
     model = trainer.model
-    optimizer = trainer.optimizer
+    optimizer = trainer.model_optimizer
 
     transitions_correct = Counter()
     transitions_incorrect = Counter()
     repairs_used = Counter()
     fake_transitions_used = 0
 
-    for interval_start in tqdm(interval_starts, postfix="Batch"):
+    for interval_start in tqdm(interval_starts, postfix="Model"):
         batch = epoch_data[interval_start:interval_start+args['train_batch_size']]
         # the batch will be empty when all trees from this epoch are trained
         # now we add the state to the trees in the batch
@@ -546,7 +666,7 @@ def build_batch_from_tagged_words(batch_size, data_iterator, model):
         tree_batch = parse_transitions.initial_state_from_words(tree_batch, model)
     return tree_batch
 
-def parse_sentences(data_iterator, build_batch_fn, batch_size, model):
+def parse_sentences(data_iterator, build_batch_fn, batch_size, model, keep_state=False):
     """
     Given an iterator over the data and a method for building batches, returns a bunch of parse trees.
 
@@ -572,12 +692,15 @@ def parse_sentences(data_iterator, build_batch_fn, batch_size, model):
         tree_batch = parse_transitions.bulk_apply(model, tree_batch, transitions)
 
         remove = set()
-        for idx, tree in enumerate(tree_batch):
-            if tree.finished(model):
-                predicted_tree = tree.get_tree(model)
-                gold_tree = tree.gold_tree
+        for idx, state in enumerate(tree_batch):
+            if state.finished(model):
+                predicted_tree = state.get_tree(model)
+                gold_tree = state.gold_tree
                 # TODO: put an actual score here?
-                treebank.append((gold_tree, [(predicted_tree, 1.0)]))
+                if keep_state:
+                    treebank.append((gold_tree, [(predicted_tree, 1.0, state)]))
+                else:
+                    treebank.append((gold_tree, [(predicted_tree, 1.0, None)]))
                 remove.add(idx)
 
         tree_batch = [tree for idx, tree in enumerate(tree_batch) if idx not in remove]
@@ -608,7 +731,8 @@ def parse_tagged_words(model, words, batch_size):
     model.eval()
 
     sentence_iterator = iter(words)
-    treebank = parse_sentences(sentence_iterator, build_batch_from_tagged_words, batch_size, model)
+    with torch.no_grad():
+        treebank = parse_sentences(sentence_iterator, build_batch_from_tagged_words, batch_size, model)
 
     results = [t[1][0][0] for t in treebank]
     return results
@@ -623,7 +747,8 @@ def run_dev_set(model, dev_trees, args):
     model.eval()
 
     tree_iterator = iter(tqdm(dev_trees))
-    treebank = parse_sentences(tree_iterator, build_batch_from_trees, args['eval_batch_size'], model)
+    with torch.no_grad():
+        treebank = parse_sentences(tree_iterator, build_batch_from_trees, args['eval_batch_size'], model)
 
     if len(treebank) < len(dev_trees):
         logger.warning("Only evaluating %d trees instead of %d", len(treebank), len(dev_trees))

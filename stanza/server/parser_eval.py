@@ -19,7 +19,7 @@ def build_request(treebank):
     for gold, predictions in treebank:
         parse_result = request.treebank.add()
         parse_result.gold.CopyFrom(build_tree(gold, None))
-        for prediction, score in predictions:
+        for prediction, score, _ in predictions:
             parse_result.predicted.append(build_tree(prediction, score))
 
     return request
