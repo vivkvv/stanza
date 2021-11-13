@@ -203,3 +203,15 @@ def test_forward_timing_choices(pt):
     model = build_model(pt, '--pattn_num_heads', '4', '--pattn_num_layers', '4', '--pattn_timing', 'learned')
     run_forward_checks(model)
 
+def test_forward_labeled_transitions(pt):
+    """
+    Test with & without labels on the transition embeddings.
+
+    TODO: needs a more detailed test to check that the splits are
+    actually doing anything
+    """
+    model = build_model(pt, '--transition_embedding_labels')
+    run_forward_checks(model)
+
+    model = build_model(pt, '--no_transition_embedding_labels')
+    run_forward_checks(model)
