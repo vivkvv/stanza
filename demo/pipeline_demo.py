@@ -30,7 +30,7 @@ if __name__ == '__main__':
         sys.exit(1)
 
     # download the models
-    stanza.download(args.lang, dir=args.models_dir)
+    stanza.download(args.lang, model_dir=args.models_dir)
     # set up a pipeline
     print('---')
     print('Building pipeline...')
