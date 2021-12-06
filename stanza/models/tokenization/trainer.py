@@ -4,6 +4,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+import torch.nn.init as init
+import onnx
+import onnxruntime
+import numpy as np
+
+
 from stanza.models.common.trainer import Trainer as BaseTrainer
 from stanza.models.tokenization.utils import create_dictionary
 
@@ -17,6 +23,7 @@ class Trainer(BaseTrainer):
         self.use_cuda = use_cuda
         if model_file is not None:
             # load everything from file
+            self.model_file = model_file
             self.load(model_file)
         else:
             # build model from scratch
@@ -68,6 +75,42 @@ class Trainer(BaseTrainer):
             features = features.cuda()
 
         pred = self.model(units, features)
+
+        # export to onnx
+        onnx_export_file_name = self.model_file + ".onnx"
+        torch.onnx.export(
+            self.model,
+            (units, features),
+            onnx_export_file_name,
+            opset_version=10,
+            do_constant_folding=True,
+            input_names=['input'],
+            output_names=['output'],
+            dynamic_axes={
+                'input': {0: 'batch_size'},
+                'output': {0, 'batch_size'}
+            }
+        )
+
+        onnx_model = onnx.load(onnx_export_file_name)
+        onnx.checker.check_model(onnx_model)
+
+        # checking for onnx prediction
+        ort_session = onnxruntime.InferenceSession(onnx_export_file_name)
+
+        def to_numpy(tensor):
+            return tensor.detach().cpu().numpy()
+
+        ort_inputs = {
+            ort_session.get_inputs()[0].name: to_numpy(units),
+            ort_session.get_inputs()[1].name: to_numpy(features),
+        }
+        ort_outputs = ort_session.run(None, ort_inputs)
+
+        compare_result = np.argmax(to_numpy(pred), axis=2) - np.argmax(ort_outputs[0], axis=2)
+        print(compare_result) # all values have to be zero
+
+
 
         return pred.data.cpu().numpy()
 
