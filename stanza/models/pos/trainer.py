@@ -12,6 +12,9 @@ from stanza.models.common import utils, loss
 from stanza.models.pos.model import Tagger
 from stanza.models.pos.vocab import MultiVocab
 
+import onnx
+import onnxruntime
+
 logger = logging.getLogger('stanza')
 
 def unpack_batch(batch, use_cuda):
@@ -32,6 +35,7 @@ class Trainer(BaseTrainer):
         self.use_cuda = use_cuda
         if model_file is not None:
             # load everything from file
+            self.model_file = model_file            
             self.load(model_file, pretrain)
         else:
             # build model from scratch
@@ -70,6 +74,27 @@ class Trainer(BaseTrainer):
 
         self.model.eval()
         batch_size = word.size(0)
+
+        # export to onnx
+        onnx_export_file_name = self.model_file + ".onnx"
+        torch.onnx.export(
+            self.model,
+            (word, word_mask, wordchars, wordchars_mask, upos, xpos, ufeats, pretrained, word_orig_idx, sentlens, wordlens),
+            onnx_export_file_name,
+            export_params = True,
+            opset_version=9,
+            do_constant_folding=True,
+            input_names=['input'],
+            output_names=['output'],
+            dynamic_axes={
+                'input': {0: 'batch_size'},
+                'output': {0: 'batch_size'}
+            }
+        )
+
+        onnx_model = onnx.load(onnx_export_file_name)
+        onnx.checker.check_model(onnx_model)
+
         _, preds = self.model(word, word_mask, wordchars, wordchars_mask, upos, xpos, ufeats, pretrained, word_orig_idx, sentlens, wordlens)
         upos_seqs = [self.vocab['upos'].unmap(sent) for sent in preds[0].tolist()]
         xpos_seqs = [self.vocab['xpos'].unmap(sent) for sent in preds[1].tolist()]
